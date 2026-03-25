@@ -1,3 +1,4 @@
 .DS_Store
 data/
 skyfield-data/
+__pycache__/
