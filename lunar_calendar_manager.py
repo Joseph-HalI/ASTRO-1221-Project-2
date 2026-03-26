@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Optional
 import pandas as pd
 
 
@@ -40,7 +41,7 @@ class LunarCalendarManager:
     those in-memory tables, so repeated queries are fast.
     """
 
-    def __init__(self, data_folder=None):
+    def __init__(self, data_folder=None, year: Optional[int] = None):
         """
 
         Loads all four CSV files into memory and prepares their date columns.
@@ -53,11 +54,15 @@ class LunarCalendarManager:
         else:
             data_folder = Path(data_folder)
 
+        if year is None:
+            year = self._infer_year(data_folder)
+        self.year = int(year)
+
         # Load each CSV into a DataFrame.
-        self.lunar = pd.read_csv(data_folder / "lunar_data_2026.csv")
-        self.special_events = pd.read_csv(data_folder / "special_events_2026.csv")
+        self.lunar = pd.read_csv(data_folder / f"lunar_data_{self.year}.csv")
+        self.special_events = pd.read_csv(data_folder / f"special_events_{self.year}.csv")
         self.user_events = pd.read_csv(data_folder / "sample_user_events.csv")
-        self.dark_sky = pd.read_csv(data_folder / "dark_sky_windows_2026.csv")
+        self.dark_sky = pd.read_csv(data_folder / f"dark_sky_windows_{self.year}.csv")
 
         # CSV files store dates as plain text like "2026-06-21".
         # pd.to_datetime() converts those strings into proper date objects pandas can compare.
@@ -123,3 +128,19 @@ class LunarCalendarManager:
             "user_events": user_list,
             "is_dark_sky": is_dark_sky,
         }
+
+    @staticmethod
+    def _infer_year(data_folder: Path) -> int:
+        """
+        Infer the year from available `lunar_data_<year>.csv` files.
+        Falls back to 2026 if no match is found.
+        """
+        matches = list(Path(data_folder).glob("lunar_data_*.csv"))
+        years = []
+        for p in matches:
+            suffix = p.stem.split("_")[-1]
+            if suffix.isdigit():
+                years.append(int(suffix))
+        if not years:
+            return 2026
+        return sorted(years)[-1]
