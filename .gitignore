@@ -2,3 +2,5 @@
 data/
 skyfield-data/
 __pycache__/
+local_user_events.csv
+data/local_user_events.csv

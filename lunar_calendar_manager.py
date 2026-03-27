@@ -61,7 +61,15 @@ class LunarCalendarManager:
         # Load each CSV into a DataFrame.
         self.lunar = pd.read_csv(data_folder / f"lunar_data_{self.year}.csv")
         self.special_events = pd.read_csv(data_folder / f"special_events_{self.year}.csv")
-        self.user_events = pd.read_csv(data_folder / "sample_user_events.csv")
+        sample_user_events_path = data_folder / "sample_user_events.csv"
+        local_user_events_path = data_folder / "local_user_events.csv"
+
+        sample_user_events = pd.read_csv(sample_user_events_path)
+        if local_user_events_path.exists():
+            local_user_events = pd.read_csv(local_user_events_path)
+            self.user_events = pd.concat([sample_user_events, local_user_events], ignore_index=True)
+        else:
+            self.user_events = sample_user_events
         self.dark_sky = pd.read_csv(data_folder / f"dark_sky_windows_{self.year}.csv")
 
         # CSV files store dates as plain text like "2026-06-21".
