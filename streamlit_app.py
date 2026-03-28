@@ -1,10 +1,12 @@
 import calendar
 import html
 from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional, Set
 
+import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import streamlit as st
-from typing import Any, Dict, List, Optional, Set
 
 from lunar_calendar_manager import LunarCalendarManager
 
@@ -35,6 +37,288 @@ def _clean_record(record: dict) -> dict:
         else:
             cleaned[k] = v
     return cleaned
+
+
+# --- Moon phase diagram (matplotlib) ------------------------------------------
+#
+# The moon drawings are meant to match northern-hemisphere views:
+#   - Waxing: light grows from the right toward the left.
+#   - Waning: light shrinks from the right, so the bright part sits on the left.
+#
+# For exact quarters, full, and new we ignore small illumination noise in the CSV
+# and draw a simple "icon" shape. For Waxing/Waning *Crescent* and *Gibbous* we
+# use the illumination percentage to place the curved terminator between those icons.
+
+
+MoonVisualKind = Literal["full", "new", "first_quarter", "third_quarter", "waxing_waning"]
+
+
+def _moon_visual_kind(phase_name: Optional[str]) -> MoonVisualKind:
+    """
+    Decide whether we should draw a fixed icon (full/new/quarters) or a phase that
+    follows illumination (waxing/waning crescent and gibbous).
+    """
+    if not phase_name:
+        return "waxing_waning"
+
+    if "Full" in phase_name:
+        return "full"
+    if "New" in phase_name:
+        return "new"
+    if "First Quarter" in phase_name:
+        return "first_quarter"
+    if "Third Quarter" in phase_name:
+        return "third_quarter"
+
+    # Everything else in this project is Waxing/Waning Crescent or Gibbous.
+    return "waxing_waning"
+
+
+def _illumination_fraction(illumination: Optional[float]) -> float:
+    """Turn the CSV percentage into a 0-1 fraction, clipped so the geometry stays stable."""
+    if illumination is None or (isinstance(illumination, float) and pd.isna(illumination)):
+        return 0.0
+    return float(np.clip(float(illumination) / 100.0, 0.0, 1.0))
+
+
+def _terminator_ellipse_x(y_vals: np.ndarray, ellipse_a: float) -> np.ndarray:
+    """
+    Given an array of y-coordinates and a horizontal semi-axis *ellipse_a*, return the
+    matching x-coordinates on the terminator. We use the same shape as an ellipse
+    aligned with the moon:
+
+        (x / ellipse_a)² + (y / radius)² = 1
+
+    So at the equator (y = 0) you get x = ellipse_a.
+
+      - ellipse_a > 0  → midpoint of the terminator is on the **eastern (right)** half
+      - ellipse_a < 0  → midpoint is on the **western (left)** half
+      - ellipse_a = 0  → straight vertical line through the center (quarter moon)
+
+    The waxing and waning helpers choose *ellipse_a* so the **small** illumination
+    cases (crescents) put the terminator on the correct side — see those functions.
+
+    We only need x at each y to stitch the terminator into a closed polygon with the
+    visible lunar limb (the circular arc on either the right or left side).
+    """
+    # The ellipse equation is (x/ellipse_a)^2 + (y/radius)^2 = 1
+    # Solving for x: x = ellipse_a * sqrt(1 - (y/radius)^2)
+    # np.clip keeps the argument of sqrt non-negative despite floating-point rounding.
+    return ellipse_a * np.sqrt(np.clip(1.0 - (y_vals / 1.0) ** 2, 0.0, 1.0))
+
+
+def _waxing_lit_vertices(fraction: float, radius: float = 1.0) -> Optional[np.ndarray]:
+    """
+    Build a filled polygon for the lit part of a *waxing* moon.
+
+    *fraction* is how much of the disk is illuminated (0 = new moon, 1 = full moon).
+    For a northern-hemisphere schematic, waxing means the bright part grows from the
+    **right (east)** limb toward the left — so a thin waxing crescent is a bright
+    sliver on the **right**, not a big disk with a shadow nibble on the left.
+
+    How the terminator works
+    -------------------------
+    The terminator (boundary between sunlit and night sides) is modeled with a
+    horizontal semi-axis *ellipse_a*:
+
+        ellipse_a = radius * (1 - 2 * fraction)
+
+    Why this formula?
+    ------------------------------------
+    - Right after **new moon**, only a tiny sliver on the **right** should be lit
+      (small *fraction*). The terminator must sit just **inboard** of that lit
+      sliver — still on the **eastern** side of the disk — so at the equator the
+      terminator’s x-coordinate must be **positive** and fairly large.
+    - Plugging a small *fraction* into ``(1 - 2 * fraction)`` gives a **positive**
+      *ellipse_a*, which moves the terminator to the correct (eastern) side.
+
+    Edge cases this produces (for the math geometry; new/full are handled separately):
+      fraction → 0   →  ellipse_a → +radius   (terminator hugging the east; crescent)
+      fraction = 0.5 →  ellipse_a = 0        (straight line — first quarter)
+      fraction → 1   →  ellipse_a → -radius  (terminator crosses the west; gibbous)
+
+    The terminator always meets the moon’s north and south poles (y = ±radius) at
+    x = 0 for every *ellipse_a*, so it joins cleanly with whichever limb arc we use.
+
+    Crescent vs gibbous (same loop of code)
+    ---------------------------------------
+    We always trace:
+      1. The **right** circular limb from north pole → south pole (the sunlit “outer”
+         edge for waxing phases).
+      2. The terminator from south pole → north pole back to the start.
+
+    Whether *fraction* is below or above 50%, the sign of *ellipse_a* above picks
+    the correct bulge so the filled region is the **small bright crescent** when
+    illumination is low, and the **almost-full gibbous** when illumination is high —
+    without separate if/else shape logic.
+    """
+    if fraction <= 0.0:
+        return None  # New moon: nothing lit, draw nothing.
+    if fraction >= 1.0:
+        # Full moon: the whole disk is lit.
+        theta = np.linspace(0.0, 2.0 * np.pi, 180)
+        return np.column_stack([radius * np.cos(theta), radius * np.sin(theta)])
+
+    # ── Step 1: terminator semi-axis ──────────────────────────────────────────
+    # Positive for waxing crescent (terminator on the eastern half), negative for
+    # waxing gibbous (small dark bite on the west). Zero at first quarter.
+    ellipse_a = radius * (1.0 - 2.0 * fraction)
+
+    n_pts = 90  # More points = smoother curves; 90 is plenty for this size.
+
+    # ── Step 2: right rim arc (top → bottom, passing through the rightmost point) ──
+    # Angles: π/2 at the top of the circle, 0 at the right, -π/2 at the bottom.
+    theta_rim = np.linspace(np.pi / 2.0, -np.pi / 2.0, n_pts)
+    rim_x = radius * np.cos(theta_rim)
+    rim_y = radius * np.sin(theta_rim)
+
+    # ── Step 3: terminator curve (bottom → top) ───────────────────────────────
+    # y runs from -radius to +radius.  x = ellipse_a * sqrt(1 - (y/radius)^2).
+    # For waxing *crescent* (small fraction), ellipse_a > 0 so the terminator sits
+    # in the eastern half and the lit patch stays a thin blade on the **right**.
+    # For waxing *gibbous* (large fraction), ellipse_a < 0 and the terminator moves
+    # west so only a small unlit region remains on the **left**.
+    y_term = np.linspace(-radius, radius, n_pts)
+    x_term = _terminator_ellipse_x(y_term, ellipse_a)
+
+    # ── Step 4: concatenate into a closed polygon ──────────────────────────────
+    # Rim goes top→bottom; terminator goes bottom→top.  Together they enclose the
+    # lit region and matplotlib's fill() closes the shape automatically.
+    xs = np.concatenate([rim_x, x_term])
+    ys = np.concatenate([rim_y, y_term])
+    return np.column_stack([xs, ys])
+
+
+def _waning_lit_vertices(fraction: float, radius: float = 1.0) -> Optional[np.ndarray]:
+    """
+    Build a filled polygon for the lit part of a *waning* moon.
+
+    *fraction* is how much of the disk is illuminated (0 = new moon, 1 = full moon).
+    Waning is the mirror of waxing: the bright cap hugs the **left (west)** limb,
+    so a thin **waning** crescent is a bright sliver on the **left**.
+
+    Mirror recipe (why the formula differs from waxing)
+    ---------------------------------------------------
+    Waxing uses the **right** limb arc plus a terminator whose semi-axis is
+    ``radius * (1 - 2 * fraction)``. For waning we keep the same ellipse *family* but
+    flip the bow direction relative to that eastern limb:
+
+        ellipse_a = radius * (2 * fraction - 1)
+
+    Check intuition for a **waning crescent** (small *fraction*): ``(2f - 1)`` is
+    **negative**, so the terminator’s midpoint slides to the **western** half and the
+    lit flake appears on the **left** — exactly what we want.
+
+    We trace the **left** circular limb (north → south through longitude π) and close
+    along the terminator, so the same “one arc + one terminator” pattern covers both
+    crescent and gibbous waning phases automatically.
+    """
+    if fraction <= 0.0:
+        return None  # New moon: nothing lit.
+    if fraction >= 1.0:
+        theta = np.linspace(0.0, 2.0 * np.pi, 180)
+        return np.column_stack([radius * np.cos(theta), radius * np.sin(theta)])
+
+    # ── Step 1: terminator semi-axis (mirror of the waxing formula) ─────────────
+    # Waxing uses (1 - 2f); waning uses (2f - 1) so crescent/gibbous swap correctly
+    # to the western limb. At third quarter both formulas give 0, same as waxing.
+    ellipse_a = radius * (2.0 * fraction - 1.0)
+
+    n_pts = 90
+
+    # ── Step 2: left rim arc (top → bottom, passing through the leftmost point) ──
+    # Angles: π/2 at the top, π at the far left, 3π/2 (= -π/2) at the bottom.
+    theta_rim = np.linspace(np.pi / 2.0, 3.0 * np.pi / 2.0, n_pts)
+    rim_x = radius * np.cos(theta_rim)
+    rim_y = radius * np.sin(theta_rim)
+
+    # ── Step 3: terminator curve (bottom → top) ───────────────────────────────
+    # Same sqrt-based ellipse as waxing; only *ellipse_a* (and the left rim) differ.
+    y_term = np.linspace(-radius, radius, n_pts)
+    x_term = _terminator_ellipse_x(y_term, ellipse_a)
+
+    # ── Step 4: concatenate into a closed polygon ──────────────────────────────
+    xs = np.concatenate([rim_x, x_term])
+    ys = np.concatenate([rim_y, y_term])
+    return np.column_stack([xs, ys])
+
+
+def _guess_waxing_from_name(phase_name: Optional[str]) -> bool:
+    """Return True if the label says waxing, False if it says waning, default waxing."""
+    if not phase_name:
+        return True
+    if "Waning" in phase_name:
+        return False
+    return True
+
+
+def build_moon_phase_figure(
+    phase_name: Optional[str],
+    illumination: Optional[float],
+    *,
+    figsize: tuple[float, float] = (3.2, 3.2),
+) -> plt.Figure:
+    """
+    Create a simple matplotlib Figure showing the moon for the picked date.
+
+    This function only draws; Streamlit displays it with ``st.pyplot``.
+    """
+    kind = _moon_visual_kind(phase_name)
+    fraction = _illumination_fraction(illumination)
+    is_waxing = _guess_waxing_from_name(phase_name)
+
+    # Cosmetic colors (feel free to tweak).
+    sky = "#0b1020"
+    shadow = "#1f1f1f"
+    light = "#f2e6b9"
+    edge = "#444444"
+
+    fig, ax = plt.subplots(figsize=figsize, dpi=100)
+    ax.set_facecolor(sky)
+    fig.patch.set_facecolor(sky)
+
+    radius = 1.0
+    disk_theta = np.linspace(0.0, 2.0 * np.pi, 200)
+    disk_xy = np.column_stack([radius * np.cos(disk_theta), radius * np.sin(disk_theta)])
+
+    lit_patch: Optional[np.ndarray] = None
+
+    if kind == "full":
+        lit_patch = disk_xy
+    elif kind == "new":
+        lit_patch = None
+    elif kind == "first_quarter":
+        lit_patch = _waxing_lit_vertices(0.5, radius)
+    elif kind == "third_quarter":
+        lit_patch = _waning_lit_vertices(0.5, radius)
+    else:
+        lit_patch = _waxing_lit_vertices(fraction, radius) if is_waxing else _waning_lit_vertices(fraction, radius)
+
+    # Dark disk (the whole moon), then draw light on top where needed.
+    ax.fill(disk_xy[:, 0], disk_xy[:, 1], color=shadow, zorder=1)
+    if lit_patch is not None:
+        ax.fill(lit_patch[:, 0], lit_patch[:, 1], color=light, zorder=2)
+
+    ax.plot(disk_xy[:, 0], disk_xy[:, 1], color=edge, linewidth=1.0, zorder=3)
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.axis("off")
+    lim = radius * 1.15
+    ax.set_xlim(-lim, lim)
+    ax.set_ylim(-lim, lim)
+
+    # Build the subtitle shown just below the moon disk.
+    # For the fixed-icon phases (full, new, quarters) we just show the phase name.
+    # For waxing/waning phases we add the illumination percentage so the viewer
+    # can see exactly how far through the cycle the moon currently is.
+    subtitle = phase_name or "Unknown phase"
+    if kind == "waxing_waning":
+        subtitle = f"{subtitle}\nIllumination: {fraction * 100:.1f}%"
+
+    # Only one title line — no "schematic" label above the figure.
+    ax.set_title(subtitle, color="#c8c8d8", fontsize=9, pad=6)
+
+    return fig
 
 
 def _build_year_day_info(manager: LunarCalendarManager) -> Dict[str, Dict[str, Any]]:
@@ -463,21 +747,34 @@ def main() -> None:
         st.info("No data found for that date in your CSV files.")
         return
 
-    st.subheader(f"Details for {picked_key}")
-    st.write(
-        {
-            "phase_name": picked_info.get("phase_name"),
-            "illumination": picked_info.get("illumination"),
-            "is_dark_sky": picked_info.get("is_dark_sky"),
-        }
-    )
+    # Two columns: facts on the left, moon sketch on the right (easy to scan on wide layouts).
+    details_col, moon_col = st.columns([1.1, 0.9], gap="large")
 
-    if picked_info.get("special_events"):
-        st.markdown("**Special events**")
-        st.write(picked_info["special_events"])
-    if picked_info.get("user_events"):
-        st.markdown("**User events**")
-        st.write(picked_info["user_events"])
+    with details_col:
+        st.subheader(f"Details for {picked_key}")
+        st.write(
+            {
+                "phase_name": picked_info.get("phase_name"),
+                "illumination": picked_info.get("illumination"),
+                "is_dark_sky": picked_info.get("is_dark_sky"),
+            }
+        )
+
+        if picked_info.get("special_events"):
+            st.markdown("**Special events**")
+            st.write(picked_info["special_events"])
+        if picked_info.get("user_events"):
+            st.markdown("**User events**")
+            st.write(picked_info["user_events"])
+
+    with moon_col:
+        st.subheader("Moon Phase View")
+        fig = build_moon_phase_figure(
+            picked_info.get("phase_name"),
+            picked_info.get("illumination"),
+        )
+        st.pyplot(fig, use_container_width=True)
+        plt.close(fig)
 
 
 if __name__ == "__main__":
